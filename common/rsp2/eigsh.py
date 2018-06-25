@@ -152,15 +152,19 @@ def try_shift_invert(m,
             assert not is_overlapping(evecs[i], evecs[k])
     return evals, evecs
 
+def eigenvalue(freqs): return np.sign(freqs) * np.square(freqs / SQRT_EIGENVALUE_TO_WAVENUMBER)
+def wavenumber(evals): return np.sign(evals) * np.sqrt(evals) * SQRT_EIGENVALUE_TO_WAVENUMBER
 
 def collect_by_shift_invert(m,
                             *,
                             group_size,
-                            step_fraction,
+                            wavenumber_step,
+                            wavenumber_stop,
                             maxiter,
+                            max_substeps,
                             callback=None,
                             ev_history_steps=1,
-                            start=1e-5,
+                            start=eigenvalue(1e-2),
                             tol=0,
                             **kw):
     """
@@ -174,17 +178,9 @@ def collect_by_shift_invert(m,
         and quadratic time costs (due to orthogonalization); if set too low, you
         will suffer from many expensive shift-inverse matrix factorizations.
         (one is performed each step)
-    :param step_fraction:
-        Each step, advance the starting point of the search space to permanently
-        cut off this fraction of the solutions found.  In other words,
-        approximately ``step_fraction * group_size`` solutions are guaranteed to
-        be new each step, while the rest have a high probability of being
-        repeats.
-
-        If too large, you may potentially miss some solutions.
-
-        If too small, you will waste an enormous amount of time recomputing the
-        same solutions.
+    :param wavenumber_step:
+        Each step, advance the starting point of the search space by this amount,
+        permanently cutting off all solutions below.
     :param callback:
         A function to be called on the new esols discovered each step (in the
         tuple form produced by the other functions in this module).
@@ -192,6 +188,8 @@ def collect_by_shift_invert(m,
     :param ev_history_steps:
         Remember eigenvectors from up to this many steps ago, for the purpose
         of detecting repeat solutions.
+    :param max_substeps:
+        Number of times to repeat running eigsh at a frequency before moving on.
     :param maxiter:
         eigsh parameter.  You should set it explicitly to something MUCH MUCH
         MUCH smaller than scipy's default, because shift-invert at nonzero sigma
@@ -255,24 +253,21 @@ def collect_by_shift_invert(m,
     # the original `a` and `b` for as long as they are relevant.
     history_basis = []
 
-    step_size = round(group_size * step_fraction)
-    if step_size <= 0:
-        raise ValueError("negative step size!")
-
     found_evals = []
     found_func_out = []
 
     sigma = start
 
-    log.debug(" Good -- Bad (Old Wrong OrthoBad)")
+    log.debug(" Good -- Bad (Old Wrong OrthoBad LowFreq)")
     def log_count(count):
         log.debug(
-            " {:^4} -- {:^3} ({:^3} {:^5} {:^8})".format(
+            " {:^4} -- {:^3} ({:^3} {:^5} {:^8} {:^7})".format(
                 count.good,
                 count.bad.total(),
                 count.bad.repeat,
                 count.bad.wrong,
                 count.bad.ortho_bad,
+                count.bad.low_freq,
             ),
         )
 
@@ -285,77 +280,118 @@ def collect_by_shift_invert(m,
         _log_time = time.time()
         log.debug(s)
 
+    time_log = lambda _s: None # disable
+
     while True:
-        time_log("diagonalizing")
-        (step_evals, step_evecs) = eigsh_T(
-            m,
-            k=group_size,
-            sigma=sigma,
-            allow_fewer=True,
-            maxiter=maxiter,
-            # shift invert with mode='normal' and which='LA' will quite reliably
-            # produce the eigenvalues that are just above sigma.
-            which='LA',
-            tol=tol,
-            **kw
-        )
-        step_evecs = np.array(list(map(normalize, step_evecs)))
+        time_log("precomputing OPinv")
+        OPinv = get_OPinv(m, M=None, sigma=sigma, tol=tol)
 
-        # FIXME half-duplicated code from the negative mode search
-        #       with only minor changes (refactoring hazard)
-
+        # All new solutions added to the eigenbasis this step.
         new_good_evals = []
         new_good_evecs = []
-        step_valid_evals = []
+
+        # For each ket in the history, contains the total overlap (probability)
+        # against all kets computed across all substeps of this step.
+        #
+        # When it is too small, the ket ages towards eviction.
+        #
+        # (generally a float from 0 to max_substeps)
         history_overlap_probs = np.zeros((len(history_basis),))
 
-        # (iifes to limit scope and catch stupid-but-deadly naming bugs)
-        @iife
-        def _inspection_loop():
-            time_log("inspecting")
-            nonlocal step_valid_evals
-            nonlocal history_overlap_probs
+        time_log("diagonalizing")
+        for _ in range(max_substeps):
+            (substep_evals, substep_evecs) = eigsh_T(
+                m,
+                k=group_size,
+                sigma=sigma,
+                allow_fewer=True,
+                maxiter=maxiter,
+                # shift invert with mode='normal' and which='LA' will quite reliably
+                # produce the eigenvalues that are just above sigma.
+                which='LA',
+                tol=tol,
+                OPinv=OPinv,
+                **kw
+            )
+            substep_evecs = np.array(list(map(normalize, substep_evecs)))
 
-            count = Count()
-            count.good = 0
-            count.bad = Count()
-            count.bad.wrong = 0
-            count.bad.repeat = 0
-            count.bad.ortho_bad = 0
+            # (iifes to limit scope and catch stupid-but-deadly naming bugs)
+            @iife
+            def _inspection_loop():
+                time_log("inspecting")
+                nonlocal new_good_evals
+                nonlocal new_good_evecs
+                nonlocal history_overlap_probs
 
-            step_valid_evals, step_valid_evecs = zip(*[
-                (eval, evec)
-                for (eval, evec) in zip(step_evals, step_evecs)
-                if is_valid_esol(m, eval, evec, tol=tol)
-            ])
+                count = Count()
+                count.good = 0
+                count.bad = Count()
+                count.bad.wrong = 0
+                count.bad.repeat = 0
+                count.bad.low_freq = 0
+                count.bad.ortho_bad = 0
 
-            count.bad.wrong += len(step_evals) - len(step_valid_evals)
+                # Simply throw away stuff below sigma. It's quite possible
+                # that it is linearly dependent with vectors that we have
+                # long since dropped from the history.
+                substep_valid_esols = (substep_evals, substep_evecs)
+                substep_valid_esols = list(zip(*[
+                    (eval, evec)
+                    for (eval, evec) in zip(*substep_valid_esols)
+                    if eval >= sigma
+                ])) or [[], []]
 
-            for (eval, evec) in zip(step_valid_evals, step_valid_evecs):
-                # Prepare it for possible insertion.
-                evec, overlap_probs = mgs_step(evec,
-                                               (h.evec for h in history_basis),
-                                               return_overlaps=True)
+                count.bad.low_freq += len(substep_evals) - len(substep_valid_esols[0])
 
-                # Linearly dependent with existing solutions?
-                if sum(overlap_probs) > 0.95:
-                    # Too much overlap, the result might be garbage.
-                    count.bad.repeat += 1
-                    continue
+                # Some results may be garbage (if so, usually more than one...)
+                substep_valid_esols = list(zip(*[
+                    (eval, evec)
+                    for (eval, evec) in zip(*substep_valid_esols)
+                    if is_valid_esol(m, eval, evec, tol=tol)
+                ])) or [[], []]
+                count.bad.wrong += len(substep_evals) - len(substep_valid_esols[0])
+                count.bad.wrong -= count.bad.low_freq
 
-                # We didn't ruin it, did we?
-                if not is_valid_esol(m, eval, evec, tol=tol):
-                    count.bad.ortho_bad += 1
-                    continue
+                for (eval, evec) in zip(*substep_valid_esols):
+                    # Prepare it for possible insertion.
+                    evec, overlap_probs = mgs_step(evec,
+                                                   (h.evec for h in history_basis),
+                                                   return_overlaps=True)
 
-                # It's a good one.
-                # Record it to be added to history_basis later.
-                count.good += 1
-                new_good_evals.append(eval)
-                new_good_evecs.append(evec)
-                history_overlap_probs += overlap_probs
+                    # Record overlaps to ensure we don't evict the original kets
+                    # that were degenerate with anything discovered this round.
+                    history_overlap_probs += overlap_probs
 
-            log_count(count)
+                    # Linearly dependent with existing solutions?
+                    if sum(overlap_probs) > 0.95:
+                        # Too much overlap, the result might be garbage.
+                        count.bad.repeat += 1
+                        continue
+
+                    # We didn't ruin it, did we?
+                    if not is_valid_esol(m, eval, evec, tol=tol):
+                        count.bad.ortho_bad += 1
+                        continue
+
+                    # It's a good one.
+                    # Log it for calling the callback later.
+                    count.good += 1
+                    new_good_evals.append(eval)
+                    new_good_evecs.append(evec)
+
+                    # Put it in the history pronto to preserve the correctness
+                    # of mgs_step.
+                    hist = Struct()
+                    hist.evec = evec
+                    hist.age = 0
+                    history_basis.append(hist)
+
+                    # The new vector obviously overlaps with the eigensols
+                    # we computed this substep, so start it out with prob 1.0.
+                    # (this ensures it will not be deleted this step)
+                    history_overlap_probs = np.concatenate((history_overlap_probs, [1.0]))
+
+                log_count(count)
 
         time_log("updating")
         @iife
@@ -374,33 +410,16 @@ def collect_by_shift_invert(m,
                 [h.age >= ev_history_steps for h in history_basis],
             )
 
-            for ev in new_good_evecs:
-                hist = Struct()
-                hist.evec = ev
-                hist.age = 0
-                history_basis.append(hist)
-
-        found_evals.extend(new_good_evals)
-        if callback:
-            time_log("calling callback")
-            found_func_out.extend(callback((new_good_evals, new_good_evecs)))
-
-        old_sigma = sigma
-        try: new_sigma = step_valid_evals[step_size]
-        except IndexError:
+        sigma = eigenvalue(wavenumber(sigma) + wavenumber_step)
+        if wavenumber(sigma) >= wavenumber_stop:
             break
 
-        # Advance sigma to *just below* one of the eigenvalues found.
-        # We don't want to advance exactly onto an eigenvalue because it would
-        # create an infinitely large eigenvalue in the transformed problem
-        # (potentially causing all eigensolutions on the next step to be
-        #  complete garbage)
-        #
-        # TODO: I wonder what the likelihood is of this landing right on top
-        # of another eigenvalue. How close do we have to be for it to cause
-        # problems in practice?
-        fuzz = (new_sigma - old_sigma) * log_uniform(1e-3, 1e-5)
-        sigma = new_sigma - fuzz
+        if new_good_evals:
+            found_evals.extend(new_good_evals)
+            if callback:
+                time_log("calling callback")
+                found_func_out.extend(callback((new_good_evals, new_good_evecs)))
+
 
     perm = np.argsort(found_evals)
     evals = np.array(found_evals)[perm]
@@ -492,6 +511,3 @@ def is_valid_esol(m, eval, evec, tol): # (tol should be the one given to eigsh)
 
 def lazy_any(it): return any(pred() for pred in it)
 def lazy_all(it): return all(pred() for pred in it)
-
-def eigenvalue(freqs): return np.sign(freqs) * np.square(freqs / SQRT_EIGENVALUE_TO_WAVENUMBER)
-def wavenumber(evals): return np.sign(evals) * np.sqrt(evals) * SQRT_EIGENVALUE_TO_WAVENUMBER
