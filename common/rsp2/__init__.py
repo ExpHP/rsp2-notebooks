@@ -1,2 +1,2 @@
 from . import eigsh
-from . import raman
+from . import analyze

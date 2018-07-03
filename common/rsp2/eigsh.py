@@ -28,7 +28,7 @@ SQRT_EIGENVALUE_TO_WAVENUMBER = SQRT_EIGENVALUE_TO_THZ * THZ_TO_WAVENUMBER
 
 iife = lambda f: f()
 
-class Struct(): pass
+class Struct: pass
 
 def eigsh_T(*args,
             allow_fewer=False,
@@ -161,7 +161,6 @@ def collect_by_shift_invert(m,
                             wavenumber_step,
                             wavenumber_stop,
                             maxiter,
-                            max_substeps,
                             callback=None,
                             ev_history_steps=1,
                             start=eigenvalue(1e-2),
@@ -178,6 +177,8 @@ def collect_by_shift_invert(m,
         and quadratic time costs (due to orthogonalization); if set too low, you
         will suffer from many expensive shift-inverse matrix factorizations.
         (one is performed each step)
+
+        Capped at N - 1.
     :param wavenumber_step:
         Each step, advance the starting point of the search space by this amount,
         permanently cutting off all solutions below.
@@ -188,8 +189,6 @@ def collect_by_shift_invert(m,
     :param ev_history_steps:
         Remember eigenvectors from up to this many steps ago, for the purpose
         of detecting repeat solutions.
-    :param max_substeps:
-        Number of times to repeat running eigsh at a frequency before moving on.
     :param maxiter:
         eigsh parameter.  You should set it explicitly to something MUCH MUCH
         MUCH smaller than scipy's default, because shift-invert at nonzero sigma
@@ -212,18 +211,7 @@ def collect_by_shift_invert(m,
         ``evals``, or ``(evals, func_outputs)`` if a callback was supplied
     """
 
-    # # Search ahead of time for an estimate on max eigenvalue.
-    # # (or more specifically, a number that's "just a bit less")
-    # @iife
-    # def upper_eval_guesstimate():
-    #     (large_evals, _) = eigsh_T(m,
-    #                                maxiter=10 * np.sqrt(m.shape[0]),
-    #                                allow_fewer=True,
-    #                                k=40,
-    #                                which='LA',
-    #                                **kw)
-    #     maximum = max(large_evals)
-    #     return maximum - (maximum - min(large_evals)) * 1e-2
+    group_size = min(group_size, m.shape[0] - 1)
 
     # An orthonormal basis of vectors, each stored with the number of steps
     # since the last time it has had a sizable overlap with a step's eigsh
@@ -256,8 +244,6 @@ def collect_by_shift_invert(m,
     found_evals = []
     found_func_out = []
 
-    sigma = start
-
     log.debug(" Good -- Bad (Old Wrong OrthoBad LowFreq)")
     def log_count(count):
         log.debug(
@@ -280,11 +266,15 @@ def collect_by_shift_invert(m,
         _log_time = time.time()
         log.debug(s)
 
-    time_log = lambda _s: None # disable
-
-    while True:
+    #time_log = lambda _s: None # disable
+    step_fsm = StepFsm(max_history_steps=ev_history_steps,
+                       sigma_start=start,
+                       sigma_step=(lambda v: eigenvalue(wavenumber(v) + wavenumber_step)),
+                       sigma_stop=eigenvalue(wavenumber_stop),
+                      )
+    while step_fsm:
         time_log("precomputing OPinv")
-        OPinv = get_OPinv(m, M=None, sigma=sigma, tol=tol)
+        OPinv = get_OPinv(m, M=None, sigma=step_fsm.sigma(), tol=tol)
 
         # All new solutions added to the eigenbasis this step.
         new_good_evals = []
@@ -298,17 +288,18 @@ def collect_by_shift_invert(m,
         # (generally a float from 0 to max_substeps)
         history_overlap_probs = np.zeros((len(history_basis),))
 
-        time_log("diagonalizing")
-        for _ in range(max_substeps):
+        substep_fsm = step_fsm.substep_fsm()
+        while substep_fsm:
+            time_log("diagonalizing")
             (substep_evals, substep_evecs) = eigsh_T(
                 m,
                 k=group_size,
-                sigma=sigma,
+                sigma=step_fsm.sigma(),
                 allow_fewer=True,
                 maxiter=maxiter,
                 # shift invert with mode='normal' and which='LA' will quite reliably
                 # produce the eigenvalues that are just above sigma.
-                which='LA',
+                which=substep_fsm.which(),
                 tol=tol,
                 OPinv=OPinv,
                 **kw
@@ -322,6 +313,7 @@ def collect_by_shift_invert(m,
                 nonlocal new_good_evals
                 nonlocal new_good_evecs
                 nonlocal history_overlap_probs
+                nonlocal substep_fsm
 
                 count = Count()
                 count.good = 0
@@ -331,14 +323,14 @@ def collect_by_shift_invert(m,
                 count.bad.low_freq = 0
                 count.bad.ortho_bad = 0
 
-                # Simply throw away stuff below sigma. It's quite possible
-                # that it is linearly dependent with vectors that we have
-                # long since dropped from the history.
+                # Simply throw away stuff on the wrong side of sigma. It's quite
+                # possible that stuff below sigma is linearly dependent with
+                # vectors that we have long since dropped from the history.
                 substep_valid_esols = (substep_evals, substep_evecs)
                 substep_valid_esols = list(zip(*[
                     (eval, evec)
                     for (eval, evec) in zip(*substep_valid_esols)
-                    if eval >= sigma
+                    if step_fsm.value_is_in_range(eval)
                 ])) or [[], []]
 
                 count.bad.low_freq += len(substep_evals) - len(substep_valid_esols[0])
@@ -393,6 +385,8 @@ def collect_by_shift_invert(m,
 
                 log_count(count)
 
+                substep_fsm.advance(found_something=count.good > 0)
+
         time_log("updating")
         @iife
         def _update_history():
@@ -410,16 +404,13 @@ def collect_by_shift_invert(m,
                 [h.age >= ev_history_steps for h in history_basis],
             )
 
-        sigma = eigenvalue(wavenumber(sigma) + wavenumber_step)
-        if wavenumber(sigma) >= wavenumber_stop:
-            break
-
         if new_good_evals:
             found_evals.extend(new_good_evals)
             if callback:
                 time_log("calling callback")
                 found_func_out.extend(callback((new_good_evals, new_good_evecs)))
 
+        step_fsm.advance()
 
     perm = np.argsort(found_evals)
     evals = np.array(found_evals)[perm]
@@ -427,6 +418,106 @@ def collect_by_shift_invert(m,
         return evals, permute_python_list(found_func_out, perm)
     else:
         return evals
+
+
+class StepFsm:
+    # Number of substeps in a row that must produce nothing before we assume
+    # that the solution space in that direction is exhausted.
+
+    """
+    Finite state machine that determines the "which" argument for each
+    substep in collect_by_shift_invert.
+    """
+    def __init__(self, *, sigma_start, sigma_step, max_history_steps, sigma_stop):
+        assert callable(sigma_step)
+        self._sigma = sigma_start
+        self._sigma_step = sigma_step
+        self._sigma_stop = sigma_stop
+        self._sigma_history = [] # sigma values within last max_history_steps
+        self._max_history_steps = max_history_steps
+        self._is_first_step = True
+
+        # a value large enough that, if we were to accept it now, we risk
+        # forgetting the eigenvector before we see anything else degenerate with
+        # it.
+        self._max_value = self._sigma
+        for _ in range(self._max_history_steps):
+            self._max_value = self._sigma_step(self._max_value)
+
+    def sigma(self):
+        assert self
+        return self._sigma
+
+    def __bool__(self):
+        """ Is there remaining work? """
+        return bool(self._sigma <= self._sigma_stop) # bool() because numpy
+
+    def substep_fsm(self):
+        assert self
+        return SubstepFsm(is_first_step=self._is_first_step)
+
+    def advance(self):
+        assert self
+        self._is_first_step = False
+        self._sigma_history.append(self._sigma)
+        self._sigma = self._sigma_step(self._sigma)
+        self._max_value = self._sigma_step(self._max_value)
+        if len(self._sigma_history) > self._max_history_steps:
+            del self._sigma_history[0]
+
+    # reject values too far away from sigma, where we risk forgetting about
+    # (or having already forgotten) eigenvectors of solutions around that
+    # eigenvalue.
+    def value_is_in_range(self, value):
+        return all([
+            self._is_first_step or self._sigma_history[0] <= value,
+            value <= self._max_value,
+        ])
+
+class SubstepFsm:
+    # Number of substeps in a row that must produce nothing before we assume
+    # that the solution space in that direction is exhausted.
+    TRANSITION_CAP = 2
+
+    """
+    Finite state machine that determines the "which" argument for each
+    substep in collect_by_shift_invert.
+    """
+    def __init__(self, *, is_first_step):
+        self._which = 'LA' if is_first_step else 'SA'
+
+        # how many substeps in a row that have produced nothing
+        #
+        # start with this nonzero so that, if nothing is found on the first
+        # substep, it transitions to SA immediately (but if anything IS found,
+        # then multiple consecutive "empty" substeps are required)
+        self.found_nothing_count = self.TRANSITION_CAP
+
+    def which(self):
+        assert self
+        return self._which
+
+    def __bool__(self):
+        """ Is there remaining work? """
+        return self._which is not None
+
+    def advance(self, *, found_something):
+        assert self
+
+        if found_something:
+            self.found_nothing_count = 0
+        else:
+            self.found_nothing_count += 1
+            if self.found_nothing_count >= self.TRANSITION_CAP:
+                self.found_nothing_count = 0
+
+                if self._which == 'LA':
+                    self._which = 'SA'
+                elif self._which == 'SA':
+                    self._which = None
+                else:
+                    assert False, "complete switch"
+
 
 def log_uniform(min_value, max_value):
     """
