@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+mkdir -p out-sparse
+for SRC in input/layers-ab input/small-angle; do
+  for P in $(ls $SRC); do
+    D=out-sparse/$P
+    if [[ -e $D/final.structure ]]; then
+      continue
+    fi
+    if [[ $P == 001-b ]]; then continue; fi # AA relaxes into AB
+#    if [[ $P == 1027-a ]]; then continue; fi # ran for 14 hours and counting
+
+    decorate_lines() { awk '$0="'"$P: "'"$0'; }
+    rsp2 -c settings-sparse.yaml $SRC/$P/layers.yaml -o $D -f 2> >(decorate_lines >&2) || {
+      rm -f $D/gamma-dynmat.json{,.gz}
+      continue
+    }
+    # FIXME this file shouldn't even be saved unless requested
+    rm -f $D/force-sets
+    rm -f $D/lammps-data-trace
+    rm -f $D/visualize-forces
+    gzip $D/gamma-dynmat.json
+  done
+done
